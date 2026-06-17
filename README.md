@@ -1,6 +1,6 @@
 # tongflow-api-openai
 
-Official TongFlow plugin. Text generation via the [OpenAI](https://openai.com) chat API.
+Official [TongFlow](https://github.com/tong-io/tongflow) plugin. Text generation via the [OpenAI](https://openai.com) chat API.
 
 ## Capabilities
 
