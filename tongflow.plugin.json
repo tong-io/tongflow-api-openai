@@ -1,0 +1,29 @@
+{
+    "env": [
+        {
+            "key": "OPENAI_API_KEY",
+            "required": true,
+            "description": "Key for the target OpenAI-compatible endpoint",
+            "url": "https://platform.openai.com/api-keys"
+        },
+        {
+            "key": "OPENAI_BASE_URL",
+            "default": "https://api.openai.com/v1",
+            "description": "OpenAI-compatible endpoint (Azure / relay / vLLM / Ollama)"
+        },
+        {
+            "key": "OPENAI_CHAT_MODEL",
+            "default": "gpt-4o-mini",
+            "description": "Chat model id"
+        },
+        {
+            "key": "OPENAI_IMAGE_MODEL",
+            "default": "gpt-image-2",
+            "description": "Image model id"
+        },
+        {
+            "key": "OPENAI_IMAGE_SIZE",
+            "description": "Force an image size (e.g. 1024x1024 / auto); defaults to the node's size"
+        }
+    ]
+}
