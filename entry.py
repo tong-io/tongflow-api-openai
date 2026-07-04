@@ -12,6 +12,10 @@ from tongflow.node_slots import NodeSlots
 from tongflow.slots import node_slot
 from tongflow.protocol import asset, prompt_media_to_bytes
 from tongflow.models.gen_text import GenTextInput, GenTextOutput
+from tongflow.models.audio_describe import (
+    AudioDescribeInput,
+    AudioDescribeOutput,
+)
 from tongflow.models.split_text import SplitTextInput, SplitTextOutput
 from tongflow.models.image_gen import ImageGenInput, ImageGenOutput
 from tongflow.models.image_edit import ImageEditInput, ImageEditOutput
@@ -24,6 +28,9 @@ from tongflow.llm_batch_handlers import arrange_group_output, drop_video_output
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_IMAGE_MODEL = "gpt-image-2"
+# Chat-completions audio-in model (gpt-audio is the GA successor of
+# gpt-4o-audio-preview); text-only chat models reject input_audio parts.
+DEFAULT_AUDIO_MODEL = "gpt-audio"
 
 
 def _resolve_base_url() -> str:
@@ -43,6 +50,10 @@ def _require_api_key() -> str:
 
 def _resolve_chat_model() -> str:
     return (os.environ.get("OPENAI_CHAT_MODEL") or "").strip() or DEFAULT_MODEL
+
+
+def _resolve_audio_model() -> str:
+    return (os.environ.get("OPENAI_AUDIO_MODEL") or "").strip() or DEFAULT_AUDIO_MODEL
 
 
 def _resolve_image_model() -> str:
@@ -348,8 +359,59 @@ def arrange_group(input: ArrangeGroupInput) -> ArrangeGroupOutput:
 # I/O boundary (it deep-constructs the typed BaseModel internally) and dumps
 # the BaseModel return to a dict. `Any` reflects the boundary, not the
 # plugin-facing contract above.
+# input_audio accepts only short format tokens; wav/mp3 are the documented set.
+_AUDIO_FORMATS = {"audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/x-wav": "wav"}
+
+
+@node_slot(NodeSlots.AUDIO_DESCRIBE)
+def audio_describe(input: AudioDescribeInput) -> AudioDescribeOutput:
+    instruction = (
+        (input.userPrompt or "").strip()
+        or (input.text or "").strip()
+        or "Describe this audio in detail (genre, mood, instruments, vocals, notable events)."
+    )
+    mime = (input.audio.mime or "audio/wav").strip().lower()
+    fmt = _AUDIO_FORMATS.get(mime) or mime.removeprefix("audio/") or "wav"
+    payload: Dict[str, Any] = {
+        "model": _resolve_audio_model(),
+        "modalities": ["text"],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": input.audio.bytesBase64,
+                            "format": fmt,
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+    body = _request(
+        f"{_resolve_base_url()}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {_require_api_key()}",
+            "Content-Type": "application/json",
+        },
+    ).decode("utf-8", errors="replace")
+    obj = json.loads(body)
+    choices = obj.get("choices") or []
+    if not choices:
+        raise RuntimeError("OpenAI response missing choices")
+    content = ((choices[0] or {}).get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("OpenAI response missing message.content")
+    return AudioDescribeOutput(success=True, text=content.strip())
+
+
 _SLOT_HANDLERS: Dict[str, Any] = {
     NodeSlots.GEN_TEXT: gen_text,
+    NodeSlots.AUDIO_DESCRIBE: audio_describe,
     NodeSlots.SPLIT_TEXT: split_text,
     NodeSlots.IMAGE_GEN: image_gen,
     NodeSlots.IMAGE_EDIT: image_edit,
