@@ -368,18 +368,32 @@ def audio_describe(input: AudioDescribeInput) -> AudioDescribeOutput:
     instruction = (
         (input.userPrompt or "").strip()
         or (input.text or "").strip()
-        or "Describe this audio in detail (genre, mood, instruments, vocals, notable events)."
+        or "Describe the clip in detail: whether it is music, speech, or "
+        "ambient sound; genre or content; mood; instruments or voice "
+        "characteristics; notable events."
     )
     mime = (input.audio.mime or "audio/wav").strip().lower()
     fmt = _AUDIO_FORMATS.get(mime) or mime.removeprefix("audio/") or "wav"
+    # gpt-audio is tuned for voice chat: a user turn that pairs text with
+    # input_audio makes it treat the clip as "not yet played" and it answers
+    # with filler instead of listening. Putting the task in the system role
+    # and sending the audio as the sole user content is the reliable shape.
     payload: Dict[str, Any] = {
         "model": _resolve_audio_model(),
         "modalities": ["text"],
         "messages": [
             {
+                "role": "system",
+                "content": (
+                    "You are an audio analysis assistant. The user's message "
+                    "IS an audio clip. Do not reply conversationally and never "
+                    "ask for the audio; it is already provided. "
+                    f"Task: {instruction}"
+                ),
+            },
+            {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": instruction},
                     {
                         "type": "input_audio",
                         "input_audio": {
@@ -388,7 +402,7 @@ def audio_describe(input: AudioDescribeInput) -> AudioDescribeOutput:
                         },
                     },
                 ],
-            }
+            },
         ],
     }
     body = _request(
