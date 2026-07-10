@@ -1,4 +1,9 @@
 {
+    "plugin": {
+        "name": "OpenAI",
+        "description": "Text and image generation via any OpenAI-compatible endpoint (OpenAI, Azure, vLLM, Ollama, LM Studio).",
+        "icon": "/plugins/tongflow-api-openai.svg"
+    },
     "env": [
         {
             "key": "OPENAI_API_KEY",
