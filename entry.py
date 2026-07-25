@@ -77,17 +77,44 @@ def _env(name: str) -> str:
     return (os.environ.get(name) or "").strip()
 
 
+# Cached live catalog of model ids (GET /v1/models), fetched once per process.
+# The picker list is a curated shortlist; a picked id outside it is accepted as
+# long as the endpoint's own catalog knows it (so newer model ids aren't blocked).
+_CATALOG_IDS: set[str] | None = None
+
+
+def _catalog_ids() -> set[str]:
+    global _CATALOG_IDS
+    if _CATALOG_IDS is None:
+        ids: set[str] = set()
+        try:
+            req = Request(
+                f"{_resolve_base_url()}/models",
+                headers={"Authorization": f"Bearer {_require_api_key()}"},
+                method="GET",
+            )
+            obj = json.loads(urlopen(req, timeout=15).read().decode("utf-8", errors="replace"))  # noqa: S310
+            for m in obj.get("data") or []:
+                mid = m.get("id") if isinstance(m, dict) else None
+                if isinstance(mid, str) and mid:
+                    ids.add(mid)
+        except (HTTPError, URLError, ValueError, TimeoutError) as e:
+            sys.stderr.write(f"[openai] could not fetch model catalog: {e}\n")
+        _CATALOG_IDS = ids
+    return _CATALOG_IDS
+
+
 def _active_model(slot: str, env_override: str = "") -> str:
     """Resolve the model for a slot: the per-node pick wins, then a legacy env
     override (kept for backwards compatibility), then the list default."""
     models = TONGFLOW_SLOT_MODELS[slot]
     if _REQUEST_MODEL:
-        if _REQUEST_MODEL not in models:
-            raise RuntimeError(
-                f"unknown model {_REQUEST_MODEL!r} for {slot}; "
-                f"available: {', '.join(models)}"
-            )
-        return _REQUEST_MODEL
+        if _REQUEST_MODEL in models or _REQUEST_MODEL in _catalog_ids():
+            return _REQUEST_MODEL
+        raise RuntimeError(
+            f"unknown model {_REQUEST_MODEL!r} for {slot} (not in the picker list "
+            f"or the live /v1/models catalog)"
+        )
     if env_override:
         return env_override
     return models[0]
