@@ -18,13 +18,11 @@
         },
         {
             "key": "OPENAI_CHAT_MODEL",
-            "default": "gpt-4o-mini",
-            "description": "Chat model id"
+            "description": "Optional: force a chat model id (advanced; the per-node model picker is the normal way)"
         },
         {
             "key": "OPENAI_IMAGE_MODEL",
-            "default": "gpt-image-2",
-            "description": "Image model id"
+            "description": "Optional: force an image model id (advanced; overridden by the per-node picker)"
         },
         {
             "key": "OPENAI_IMAGE_SIZE",

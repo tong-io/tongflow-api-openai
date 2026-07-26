@@ -17,20 +17,107 @@ from tongflow.models.audio_describe import (
     AudioDescribeOutput,
 )
 from tongflow.models.split_text import SplitTextInput, SplitTextOutput
+from tongflow.models.combine_text import CombineTextInput, CombineTextOutput
 from tongflow.models.image_gen import ImageGenInput, ImageGenOutput
 from tongflow.models.image_edit import ImageEditInput, ImageEditOutput
 from tongflow.models.image_fusion import ImageFusionInput, ImageFusionOutput
+from tongflow.models.image_gen_text import ImageGenTextInput, ImageGenTextOutput
+from tongflow.models.image_describe import ImageDescribeInput, ImageDescribeOutput
+from tongflow.models.parse_document import ParseDocumentInput, ParseDocumentOutput
+from tongflow.models.transcribe import TranscribeInput, TranscribeOutput
+from tongflow.models.transcribe_timestamp import (
+    TranscribeTimestampInput,
+    TranscribeTimestampOutput,
+    TranscribeTimestampOutputRootTimeStampsItem,
+)
+from tongflow.models.text_gen_speech_preset import (
+    TextGenSpeechPresetInput,
+    TextGenSpeechPresetOutput,
+)
+from tongflow.models.text_gen_speech_instruct import (
+    TextGenSpeechInstructInput,
+    TextGenSpeechInstructOutput,
+)
 from tongflow.models.drop_video import DropVideoInput, DropVideoOutput
 from tongflow.models.arrange_group import ArrangeGroupInput, ArrangeGroupOutput
 from tongflow.llm_batch_handlers import arrange_group_output, drop_video_output
 
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_MODEL = "gpt-4o-mini"
-DEFAULT_IMAGE_MODEL = "gpt-image-2"
-# Chat-completions audio-in model (gpt-audio is the GA successor of
-# gpt-4o-audio-preview); text-only chat models reject input_audio parts.
-DEFAULT_AUDIO_MODEL = "gpt-audio"
+
+
+# ── Per-node model picker ───────────────────────────────────────────────────
+# Pure dict literal read by the platform scanner via AST (module never runs at
+# scan time). First entry per slot = the default when no model is picked.
+# Model ids verified 2026-07; OpenAI rotates minor versions — re-check the live
+# `/v1/models` list before shipping. Sora video slots are intentionally omitted
+# (the Videos API is deprecated with a 2026-09-24 hard shutdown).
+TONGFLOW_SLOT_MODELS = {
+    "gen-text": ["gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "o3", "o4-mini"],
+    "split-text": ["gpt-5-mini", "gpt-5.1", "gpt-5", "gpt-4.1"],
+    "combine-text": ["gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-4.1"],
+    "image-gen": ["gpt-image-2", "gpt-image-1.5", "gpt-image-1", "gpt-image-1-mini", "dall-e-3"],
+    "image-edit": ["gpt-image-2", "gpt-image-1.5", "gpt-image-1", "dall-e-2"],
+    "image-fusion": ["gpt-image-2", "gpt-image-1.5", "gpt-image-1"],
+    "image-gen-text": ["gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-4.1", "o3", "gpt-4o"],
+    "image-describe": ["gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o"],
+    "parse-document": ["gpt-5.1", "gpt-4.1", "gpt-5-mini"],
+    "audio-describe": ["gpt-audio", "gpt-4o-audio-preview", "gpt-4o-mini-audio-preview"],
+    "transcribe": ["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"],
+    "transcribe-timestamp": ["whisper-1"],
+    "text-gen-speech-preset": ["gpt-4o-mini-tts", "tts-1-hd", "tts-1"],
+    "text-gen-speech-instruct": ["gpt-4o-mini-tts"],
+}
+
+# Set from the request envelope's top-level `model` field in main().
+_REQUEST_MODEL: str = ""
+
+
+def _env(name: str) -> str:
+    return (os.environ.get(name) or "").strip()
+
+
+# Cached live catalog of model ids (GET /v1/models), fetched once per process.
+# The picker list is a curated shortlist; a picked id outside it is accepted as
+# long as the endpoint's own catalog knows it (so newer model ids aren't blocked).
+_CATALOG_IDS: set[str] | None = None
+
+
+def _catalog_ids() -> set[str]:
+    global _CATALOG_IDS
+    if _CATALOG_IDS is None:
+        ids: set[str] = set()
+        try:
+            req = Request(
+                f"{_resolve_base_url()}/models",
+                headers={"Authorization": f"Bearer {_require_api_key()}"},
+                method="GET",
+            )
+            obj = json.loads(urlopen(req, timeout=15).read().decode("utf-8", errors="replace"))  # noqa: S310
+            for m in obj.get("data") or []:
+                mid = m.get("id") if isinstance(m, dict) else None
+                if isinstance(mid, str) and mid:
+                    ids.add(mid)
+        except (HTTPError, URLError, ValueError, TimeoutError) as e:
+            sys.stderr.write(f"[openai] could not fetch model catalog: {e}\n")
+        _CATALOG_IDS = ids
+    return _CATALOG_IDS
+
+
+def _active_model(slot: str, env_override: str = "") -> str:
+    """Resolve the model for a slot: the per-node pick wins, then a legacy env
+    override (kept for backwards compatibility), then the list default."""
+    models = TONGFLOW_SLOT_MODELS[slot]
+    if _REQUEST_MODEL:
+        if _REQUEST_MODEL in models or _REQUEST_MODEL in _catalog_ids():
+            return _REQUEST_MODEL
+        raise RuntimeError(
+            f"unknown model {_REQUEST_MODEL!r} for {slot} (not in the picker list "
+            f"or the live /v1/models catalog)"
+        )
+    if env_override:
+        return env_override
+    return models[0]
 
 
 def _resolve_base_url() -> str:
@@ -46,18 +133,6 @@ def _require_api_key() -> str:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
     return api_key
-
-
-def _resolve_chat_model() -> str:
-    return (os.environ.get("OPENAI_CHAT_MODEL") or "").strip() or DEFAULT_MODEL
-
-
-def _resolve_audio_model() -> str:
-    return (os.environ.get("OPENAI_AUDIO_MODEL") or "").strip() or DEFAULT_AUDIO_MODEL
-
-
-def _resolve_image_model() -> str:
-    return (os.environ.get("OPENAI_IMAGE_MODEL") or "").strip() or DEFAULT_IMAGE_MODEL
 
 
 def _resolve_size(width: int | None, height: int | None) -> str | None:
@@ -91,24 +166,14 @@ def _request(
     return resp.read()
 
 
-def _chat_openai(
-    *, api_key: str, model: str, user_message: str, json_mode: bool = False
+def _chat_messages(
+    *, api_key: str, model: str, messages: List[Dict[str, Any]], json_mode: bool = False
 ) -> str:
     headers: Dict[str, str] = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    payload: Dict[str, Any] = {
-        "model": model,
-        "temperature": 1,
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是一个根据用户要求进行文本生成的万能助手，请严格按照用户的要求进行文本生成。",
-            },
-            {"role": "user", "content": user_message},
-        ],
-    }
+    payload: Dict[str, Any] = {"model": model, "messages": messages}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
 
@@ -126,6 +191,26 @@ def _chat_openai(
     if not isinstance(content, str):
         raise RuntimeError("OpenAI response missing message.content")
     return content.strip()
+
+
+def _chat_text(*, api_key: str, model: str, user_message: str, json_mode: bool = False) -> str:
+    return _chat_messages(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "你是一个根据用户要求进行文本生成的万能助手，请严格按照用户的要求进行文本生成。",
+            },
+            {"role": "user", "content": user_message},
+        ],
+        json_mode=json_mode,
+    )
+
+
+def _data_url(a: Any, *, default_mime: str = "image/png") -> str:
+    mime = (a.mime or default_mime).strip() or default_mime
+    return f"data:{mime};base64,{a.bytesBase64}"
 
 
 def _sniff_image(data: bytes) -> Tuple[str, str]:
@@ -270,15 +355,18 @@ def _build_split_user_message(input: SplitTextInput) -> str:
     )
 
 
+# ── Text slots ──────────────────────────────────────────────────────────────
+
+
 @node_slot(NodeSlots.GEN_TEXT)
 def gen_text(input: GenTextInput) -> GenTextOutput:
     user_message = (
         f"{input.userPrompt or ''}\n\n用户输入：{input.text}\n\n"
         "注意：除了明确的答案本身，不要生成任何其他多余内容。"
     )
-    answer = _chat_openai(
+    answer = _chat_text(
         api_key=_require_api_key(),
-        model=_resolve_chat_model(),
+        model=_active_model("gen-text", _env("OPENAI_CHAT_MODEL")),
         user_message=user_message,
     )
     return GenTextOutput(success=True, text=answer)
@@ -286,9 +374,9 @@ def gen_text(input: GenTextInput) -> GenTextOutput:
 
 @node_slot(NodeSlots.SPLIT_TEXT)
 def split_text(input: SplitTextInput) -> SplitTextOutput:
-    raw = _chat_openai(
+    raw = _chat_text(
         api_key=_require_api_key(),
-        model=_resolve_chat_model(),
+        model=_active_model("split-text", _env("OPENAI_CHAT_MODEL")),
         user_message=_build_split_user_message(input),
         json_mode=True,
     )
@@ -299,6 +387,29 @@ def split_text(input: SplitTextInput) -> SplitTextOutput:
     return SplitTextOutput(success=True, texts=texts)
 
 
+@node_slot(NodeSlots.COMBINE_TEXT)
+def combine_text(input: CombineTextInput) -> CombineTextOutput:
+    segments = [s for s in (input.texts or []) if isinstance(s, str) and s.strip()]
+    if not segments:
+        return CombineTextOutput(success=False, error="combine-text requires input texts")
+    instruction = (input.userPrompt or "").strip() or "Merge the following segments into one coherent text."
+    joined = "\n\n".join(f"[{i + 1}] {s}" for i, s in enumerate(segments))
+    user_message = (
+        f"{instruction}\n\n"
+        "Return ONLY the merged text — no prose, no numbering, no markdown.\n\n"
+        f"SEGMENTS:\n{joined}"
+    )
+    answer = _chat_text(
+        api_key=_require_api_key(),
+        model=_active_model("combine-text", _env("OPENAI_CHAT_MODEL")),
+        user_message=user_message,
+    )
+    return CombineTextOutput(success=True, text=answer)
+
+
+# ── Image slots ─────────────────────────────────────────────────────────────
+
+
 @node_slot(NodeSlots.IMAGE_GEN)
 def image_gen(input: ImageGenInput) -> ImageGenOutput:
     prompt = (input.text or "").strip()
@@ -306,7 +417,7 @@ def image_gen(input: ImageGenInput) -> ImageGenOutput:
         return ImageGenOutput(success=False, error="image-gen requires a text prompt")
     image = _generate_image(
         api_key=_require_api_key(),
-        model=_resolve_image_model(),
+        model=_active_model("image-gen", _env("OPENAI_IMAGE_MODEL")),
         prompt=prompt,
         size=_resolve_size(input.width, input.height),
     )
@@ -317,7 +428,7 @@ def image_gen(input: ImageGenInput) -> ImageGenOutput:
 def image_edit(input: ImageEditInput) -> ImageEditOutput:
     image = _edit_image(
         api_key=_require_api_key(),
-        model=_resolve_image_model(),
+        model=_active_model("image-edit", _env("OPENAI_IMAGE_MODEL")),
         prompt=input.text,
         images=[prompt_media_to_bytes(input.image)],
         size=_resolve_size(input.width, input.height),
@@ -334,7 +445,7 @@ def image_fusion(input: ImageFusionInput) -> ImageFusionOutput:
         )
     image = _edit_image(
         api_key=_require_api_key(),
-        model=_resolve_image_model(),
+        model=_active_model("image-fusion", _env("OPENAI_IMAGE_MODEL")),
         prompt=input.text,
         images=images,
         size=_resolve_size(input.width, input.height),
@@ -342,23 +453,85 @@ def image_fusion(input: ImageFusionInput) -> ImageFusionOutput:
     return ImageFusionOutput(success=True, image=image)
 
 
-@node_slot(NodeSlots.DROP_VIDEO)
-def drop_video(input: DropVideoInput) -> DropVideoOutput:
-    # Deterministic LLM-runner helper operating on the wire dict shape.
-    result = drop_video_output(input.model_dump())
-    return DropVideoOutput.model_construct(**result)
+# ── Vision → text slots ─────────────────────────────────────────────────────
 
 
-@node_slot(NodeSlots.ARRANGE_GROUP)
-def arrange_group(input: ArrangeGroupInput) -> ArrangeGroupOutput:
-    result = arrange_group_output(input.model_dump())
-    return ArrangeGroupOutput.model_construct(**result)
+@node_slot(NodeSlots.IMAGE_GEN_TEXT)
+def image_gen_text(input: ImageGenTextInput) -> ImageGenTextOutput:
+    content: List[Dict[str, Any]] = [{"type": "text", "text": input.text}]
+    if input.image is not None:
+        content.append({"type": "image_url", "image_url": {"url": _data_url(input.image)}})
+    messages: List[Dict[str, Any]] = []
+    if input.system:
+        messages.append({"role": "system", "content": input.system})
+    messages.append({"role": "user", "content": content})
+    text = _chat_messages(
+        api_key=_require_api_key(),
+        model=_active_model("image-gen-text", _env("OPENAI_CHAT_MODEL")),
+        messages=messages,
+    )
+    return ImageGenTextOutput(success=True, text=text)
 
 
-# Runtime dispatcher. The @node_slot wrapper accepts a raw dict at this
-# I/O boundary (it deep-constructs the typed BaseModel internally) and dumps
-# the BaseModel return to a dict. `Any` reflects the boundary, not the
-# plugin-facing contract above.
+@node_slot(NodeSlots.IMAGE_DESCRIBE)
+def image_describe(input: ImageDescribeInput) -> ImageDescribeOutput:
+    instruction = (
+        (input.userPrompt or "").strip()
+        or (input.text or "").strip()
+        or "Describe this image in detail."
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": _data_url(input.image)}},
+            ],
+        }
+    ]
+    text = _chat_messages(
+        api_key=_require_api_key(),
+        model=_active_model("image-describe", _env("OPENAI_CHAT_MODEL")),
+        messages=messages,
+    )
+    return ImageDescribeOutput(success=True, text=text)
+
+
+@node_slot(NodeSlots.PARSE_DOCUMENT)
+def parse_document(input: ParseDocumentInput) -> ParseDocumentOutput:
+    doc = input.document
+    mime = (doc.mime or "").strip().lower()
+    if "pdf" in mime:
+        media_part: Dict[str, Any] = {
+            "type": "file",
+            "file": {
+                "filename": doc.filename or "document.pdf",
+                "file_data": _data_url(doc, default_mime="application/pdf"),
+            },
+        }
+    else:
+        media_part = {"type": "image_url", "image_url": {"url": _data_url(doc)}}
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Extract all text from this document, preserving reading order. "
+                    "Output only the extracted text — no commentary.",
+                },
+                media_part,
+            ],
+        }
+    ]
+    text = _chat_messages(
+        api_key=_require_api_key(),
+        model=_active_model("parse-document", _env("OPENAI_CHAT_MODEL")),
+        messages=messages,
+    )
+    return ParseDocumentOutput(success=True, text=text)
+
+
 # input_audio accepts only short format tokens; wav/mp3 are the documented set.
 _AUDIO_FORMATS = {"audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/x-wav": "wav"}
 
@@ -379,7 +552,7 @@ def audio_describe(input: AudioDescribeInput) -> AudioDescribeOutput:
     # with filler instead of listening. Putting the task in the system role
     # and sending the audio as the sole user content is the reliable shape.
     payload: Dict[str, Any] = {
-        "model": _resolve_audio_model(),
+        "model": _active_model("audio-describe", _env("OPENAI_AUDIO_MODEL")),
         "modalities": ["text"],
         "messages": [
             {
@@ -423,13 +596,173 @@ def audio_describe(input: AudioDescribeInput) -> AudioDescribeOutput:
     return AudioDescribeOutput(success=True, text=content.strip())
 
 
+# ── Speech → text slots (transcription) ─────────────────────────────────────
+
+
+def _transcribe_request(
+    *, model: str, audio: Any, response_format: str, extra_fields: Dict[str, str]
+) -> Dict[str, Any]:
+    content = base64.b64decode(audio.bytesBase64)
+    mime = (audio.mime or "audio/mpeg").strip() or "audio/mpeg"
+    ext = mime.rsplit("/", 1)[-1] or "mp3"
+    fields: Dict[str, str] = {"model": model, "response_format": response_format}
+    fields.update(extra_fields)
+    data, content_type = _multipart(
+        fields, [("file", audio.filename or f"audio.{ext}", mime, content)]
+    )
+    body = _request(
+        f"{_resolve_base_url()}/audio/transcriptions",
+        data=data,
+        headers={"Authorization": f"Bearer {_require_api_key()}", "Content-Type": content_type},
+        timeout=300,
+    )
+    return json.loads(body.decode("utf-8", errors="replace"))
+
+
+@node_slot(NodeSlots.TRANSCRIBE)
+def transcribe(input: TranscribeInput) -> TranscribeOutput:
+    extra: Dict[str, str] = {}
+    if input.language:
+        extra["language"] = input.language
+    if input.context:
+        extra["prompt"] = input.context
+    obj = _transcribe_request(
+        model=_active_model("transcribe", _env("OPENAI_TRANSCRIBE_MODEL")),
+        audio=input.audio,
+        response_format="json",
+        extra_fields=extra,
+    )
+    text = obj.get("text") if isinstance(obj, dict) else None
+    if not isinstance(text, str):
+        return TranscribeOutput(success=False, error="transcription response missing 'text'")
+    return TranscribeOutput(success=True, text=text.strip())
+
+
+@node_slot(NodeSlots.TRANSCRIBE_TIMESTAMP)
+def transcribe_timestamp(input: TranscribeTimestampInput) -> TranscribeTimestampOutput:
+    extra: Dict[str, str] = {"timestamp_granularities[]": "segment"}
+    if input.language:
+        extra["language"] = input.language
+    if input.context:
+        extra["prompt"] = input.context
+    obj = _transcribe_request(
+        model=_active_model("transcribe-timestamp"),
+        audio=input.audio,
+        response_format="verbose_json",
+        extra_fields=extra,
+    )
+    text = obj.get("text") if isinstance(obj, dict) else None
+    if not isinstance(text, str):
+        return TranscribeTimestampOutput(
+            success=False, error="transcription response missing 'text'"
+        )
+    stamps: List[TranscribeTimestampOutputRootTimeStampsItem] = []
+    for seg in obj.get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        seg_text = seg.get("text")
+        if not isinstance(seg_text, str):
+            continue
+        stamps.append(
+            TranscribeTimestampOutputRootTimeStampsItem(
+                start=float(seg.get("start") or 0.0),
+                end=float(seg.get("end") or 0.0),
+                text=seg_text.strip(),
+            )
+        )
+    return TranscribeTimestampOutput(success=True, text=text.strip(), time_stamps=stamps)
+
+
+# ── Text → speech slots (TTS) ───────────────────────────────────────────────
+
+DEFAULT_TTS_VOICE = "alloy"
+
+
+def _synthesize_speech(
+    *, model: str, text: str, voice: str, instructions: str | None
+):
+    payload: Dict[str, Any] = {"model": model, "input": text, "voice": voice}
+    if instructions:
+        payload["instructions"] = instructions
+    raw = _request(
+        f"{_resolve_base_url()}/audio/speech",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {_require_api_key()}",
+            "Content-Type": "application/json",
+        },
+        timeout=300,
+    )
+    return asset(raw, mime="audio/mpeg")
+
+
+@node_slot(NodeSlots.TEXT_GEN_SPEECH_PRESET)
+def text_gen_speech_preset(input: TextGenSpeechPresetInput) -> TextGenSpeechPresetOutput:
+    text = (input.text or "").strip()
+    if not text:
+        return TextGenSpeechPresetOutput(success=False, error="Missing input text")
+    voice = (input.speaker or "").strip() or _env("OPENAI_TTS_VOICE") or DEFAULT_TTS_VOICE
+    audio = _synthesize_speech(
+        model=_active_model("text-gen-speech-preset", _env("OPENAI_TTS_MODEL")),
+        text=text,
+        voice=voice,
+        instructions=(input.instruct or "").strip() or None,
+    )
+    return TextGenSpeechPresetOutput(success=True, audio=audio)
+
+
+@node_slot(NodeSlots.TEXT_GEN_SPEECH_INSTRUCT)
+def text_gen_speech_instruct(
+    input: TextGenSpeechInstructInput,
+) -> TextGenSpeechInstructOutput:
+    text = (input.text or "").strip()
+    if not text:
+        return TextGenSpeechInstructOutput(success=False, error="Missing input text")
+    voice = _env("OPENAI_TTS_VOICE") or DEFAULT_TTS_VOICE
+    audio = _synthesize_speech(
+        model=_active_model("text-gen-speech-instruct"),
+        text=text,
+        voice=voice,
+        instructions=(input.instruct or "").strip() or None,
+    )
+    return TextGenSpeechInstructOutput(success=True, audio=audio)
+
+
+# ── Deterministic batch slots (no model) ────────────────────────────────────
+
+
+@node_slot(NodeSlots.DROP_VIDEO)
+def drop_video(input: DropVideoInput) -> DropVideoOutput:
+    # Deterministic LLM-runner helper operating on the wire dict shape.
+    result = drop_video_output(input.model_dump())
+    return DropVideoOutput.model_construct(**result)
+
+
+@node_slot(NodeSlots.ARRANGE_GROUP)
+def arrange_group(input: ArrangeGroupInput) -> ArrangeGroupOutput:
+    result = arrange_group_output(input.model_dump())
+    return ArrangeGroupOutput.model_construct(**result)
+
+
+# Runtime dispatcher. The @node_slot wrapper accepts a raw dict at this
+# I/O boundary (it deep-constructs the typed BaseModel internally) and dumps
+# the BaseModel return to a dict. `Any` reflects the boundary, not the
+# plugin-facing contract above.
 _SLOT_HANDLERS: Dict[str, Any] = {
     NodeSlots.GEN_TEXT: gen_text,
-    NodeSlots.AUDIO_DESCRIBE: audio_describe,
     NodeSlots.SPLIT_TEXT: split_text,
+    NodeSlots.COMBINE_TEXT: combine_text,
     NodeSlots.IMAGE_GEN: image_gen,
     NodeSlots.IMAGE_EDIT: image_edit,
     NodeSlots.IMAGE_FUSION: image_fusion,
+    NodeSlots.IMAGE_GEN_TEXT: image_gen_text,
+    NodeSlots.IMAGE_DESCRIBE: image_describe,
+    NodeSlots.PARSE_DOCUMENT: parse_document,
+    NodeSlots.AUDIO_DESCRIBE: audio_describe,
+    NodeSlots.TRANSCRIBE: transcribe,
+    NodeSlots.TRANSCRIBE_TIMESTAMP: transcribe_timestamp,
+    NodeSlots.TEXT_GEN_SPEECH_PRESET: text_gen_speech_preset,
+    NodeSlots.TEXT_GEN_SPEECH_INSTRUCT: text_gen_speech_instruct,
     NodeSlots.DROP_VIDEO: drop_video,
     NodeSlots.ARRANGE_GROUP: arrange_group,
 }
@@ -441,6 +774,7 @@ def _write(out: Dict[str, Any]) -> None:
 
 
 def main() -> int:
+    global _REQUEST_MODEL
     try:
         raw = sys.stdin.read()
         req = json.loads(raw) if raw.strip() else {}
@@ -448,6 +782,9 @@ def main() -> int:
         if not isinstance(prompt, dict):
             prompt = {}
         slot = str(req.get("nodeSlot") or "") if isinstance(req, dict) else ""
+        _REQUEST_MODEL = (
+            str(req.get("model") or "").strip() if isinstance(req, dict) else ""
+        )
 
         handler = _SLOT_HANDLERS.get(slot)
         if handler is None:
